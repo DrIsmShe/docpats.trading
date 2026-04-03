@@ -36,13 +36,11 @@ const INTERVAL = "1h";
 const LIMIT = 2000;
 
 const MIN_BALANCE = 10;
-const RISK_PERCENT = 0.06; // базовый риск 6%
-
-// ─── Смягчённые пороги для начала обучения ────────────────────────────────
-const MIN_PROFIT_FACTOR = 0.7; // было 1.3
-const MIN_WIN_RATE = 45; // было 40 (повысили чтобы не торговать мусор)
-const MIN_TRADES_REQUIRED = 10; // было 12
-const MAX_DRAWDOWN_ALLOWED = 25; // было 20
+const RISK_PERCENT = 0.01;
+const MIN_PROFIT_FACTOR = 1.3;
+const MIN_WIN_RATE = 40;
+const MIN_TRADES_REQUIRED = 12;
+const MAX_DRAWDOWN_ALLOWED = 20;
 
 // ─── Глобальное состояние для dashboard ───────────────────────────────────
 export const botState = {
@@ -143,8 +141,10 @@ const calcSLTP = (side, price, atr, strategyName) => {
       };
 };
 
+// ─── Проверка согласованности ML сигнала со стратегией ───────────────────
+// ML говорит BUY а стратегия SELL — не торгуем
 const isMLAligned = (strategySignal, mlSignal) => {
-  if (!mlSignal || mlSignal === "HOLD") return true;
+  if (!mlSignal || mlSignal === "HOLD") return true; // ML не уверен — доверяем стратегии
   if (strategySignal === "BUY" && mlSignal === "SELL") return false;
   if (strategySignal === "SELL" && mlSignal === "BUY") return false;
   return true;
@@ -158,7 +158,9 @@ export const start = async () => {
 
     await monitorPositions();
 
+    // Обновляем 1h свечи
     await fetchAndStoreCandles(SYMBOL, INTERVAL);
+    // Обновляем 4h и 1d для ML
     await fetchAndStoreCandles(SYMBOL, "4h");
     await fetchAndStoreCandles(SYMBOL, "1d");
 
@@ -183,10 +185,12 @@ export const start = async () => {
     const backtestCandles = candles.slice(0, splitIndex);
     const liveCandles = candles.slice(0);
 
+    // ── Бэктест стратегий ────────────────────────────
     const momentumResult = backtest(backtestCandles, momentumStrategy);
     const meanResult = backtest(backtestCandles, meanReversionStrategy);
     const breakoutResult = backtest(backtestCandles, breakoutStrategy);
 
+    // ── Рыночный контекст ────────────────────────────
     const regime = detectMarketRegime(candles);
     const volatility = getVolatility(candles);
     const htfTrend = await getHigherTimeframeTrend(SYMBOL);
@@ -228,7 +232,7 @@ export const start = async () => {
       volatility,
     });
 
-    if (volatility < 0.15) {
+    if (volatility < 0.18) {
       console.log("🧊 Flat / low volatility → skip");
       return;
     }
@@ -246,28 +250,23 @@ export const start = async () => {
     console.log(`📡 Signal: ${liveSignal.signal} — ${liveSignal.reason}`);
     console.log(`🔍 4h Filter: ${htfTrend} | Volume: ${volRatio.toFixed(2)}x`);
 
-    // ── Объёмные фильтры (смягчены) ──────────────────
-    if (best.name === "Breakout" && volRatio < 1.0) {
+    // ── Объёмные фильтры ─────────────────────────────
+    if (best.name === "Breakout" && volRatio < 1.3) {
       console.log("⛔ Breakout rejected: weak volume");
       await notifyNoEdge({ symbol: SYMBOL, regime });
       return;
     }
 
-    if (best.name === "Momentum" && volRatio < 0.7) {
+    if (best.name === "Momentum" && volRatio < 0.9) {
       console.log("⛔ Momentum rejected: weak volume");
       await notifyNoEdge({ symbol: SYMBOL, regime });
       return;
     }
 
+    // ── HTF фильтр ───────────────────────────────────
     if (!isSignalAlignedWithHTF(liveSignal.signal, htfTrend)) {
       console.log(`⛔ Отклонён — против 4h (${htfTrend})`);
       await notifyNoEdge({ symbol: SYMBOL, regime });
-      return;
-    }
-
-    // Спот — только BUY
-    if (liveSignal.signal === "SELL") {
-      console.log("⏸️  SELL пропущен — спот только BUY");
       return;
     }
 
@@ -276,6 +275,7 @@ export const start = async () => {
       return;
     }
 
+    // ── ML фильтр — только ML-2 (LSTM, 45 признаков) ─
     let mlConfidence = 0.5;
     let mlSignal = "HOLD";
     let mlAvailable = false;
@@ -290,7 +290,8 @@ export const start = async () => {
       Object.assign(botState, { mlSignal, mlConfidence, mlAvailable });
 
       if (mlAvailable) {
-        if (false && !isMLAligned(liveSignal.signal, mlSignal)) {
+        // Проверяем что ML согласен с направлением стратегии
+        if (!isMLAligned(liveSignal.signal, mlSignal)) {
           console.log(
             `🧠 ML-2 против стратегии: стратегия=${liveSignal.signal}, ML=${mlSignal} → отклоняем`,
           );
@@ -316,6 +317,8 @@ export const start = async () => {
       console.log(`⚠️  ML ошибка: ${mlErr.message} — продолжаем без ML`);
     }
 
+    // ── Размер позиции на основе confidence ──────────
+    // Если ML недоступен — используем базовый риск
     const confidence = mlAvailable ? mlConfidence : 0.5;
     liveSignal.confidence = confidence;
 
@@ -332,7 +335,7 @@ export const start = async () => {
     const lastATR = calculateATR(candles).at(-1);
     if (!lastATR) return;
 
-    const side = "BUY"; // Спот — всегда BUY (SELL пропущен выше)
+    const side = liveSignal.signal === "BUY" ? "BUY" : "SELL";
     const { stopLoss, takeProfit } = calcSLTP(
       side,
       currentPrice,
@@ -340,17 +343,17 @@ export const start = async () => {
       best.name,
     );
 
-    // Минимум 6% чтобы пройти Binance minNotional ($5)
+    // Динамический риск на основе ML confidence
     let riskPercent = RISK_PERCENT;
     if (confidence >= 0.75)
-      riskPercent = 0.1; // уверен → 10%
+      riskPercent = 0.015; // уверен → больше
     else if (confidence >= 0.6)
-      riskPercent = 0.08; // хорошо → 8%
+      riskPercent = 0.01; // норма
     else if (confidence >= 0.5)
-      riskPercent = 0.06; // норма  → 6%
-    else riskPercent = 0.06; // слабый → 6% минимум
+      riskPercent = 0.0075; // не очень уверен
+    else riskPercent = 0.005; // слабый сигнал
 
-    const usdtAmount = balance * riskPercent;
+    const usdtAmount = Math.max(balance * riskPercent, 6);
 
     console.log(
       `\n💸 ${side} | ${usdtAmount.toFixed(2)} USDT | ` +
@@ -358,6 +361,7 @@ export const start = async () => {
         `ML: ${(confidence * 100).toFixed(1)}%`,
     );
 
+    // ── Cooldown 60 минут ─────────────────────────────
     const lastClosed = await Position.findOne({
       symbol: SYMBOL,
       status: "CLOSED",
@@ -372,6 +376,7 @@ export const start = async () => {
       }
     }
 
+    // ── Открываем позицию ─────────────────────────────
     const position = await openPosition({
       symbol: SYMBOL,
       side,
